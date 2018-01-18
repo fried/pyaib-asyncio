@@ -29,6 +29,9 @@ from .util import data
 from .util.decorator import raise_exceptions
 from . import __version__ as pyaib_version
 
+if sys.version_info.major == 2:
+    str = unicode  # noqa
+
 MAX_LENGTH = 510
 
 #Class for storing irc related information
@@ -64,17 +67,24 @@ class Context(data.Object):
             #Assume we get the nick we want during registration
             self.botnick = nick
 
-    #privmsg with max line handling
+    # privmsg/notice with max line handling
     def PRIVMSG(self, target, msg):
+        for line in self._wrap_command('PRIVMSG', target, msg):
+            self.RAW(line)
+
+    def NOTICE(self, target, msg):
+        for line in self._wrap_command('NOTICE', target, msg):
+            self.RAW(line)
+
+    def _wrap_command(self, command, target, msg):
         if isinstance(msg, (list, tuple, set)):
             msg = ' '.join(msg)
-        privmsg = 'PRIVMSG %s :%s'
+        msgtemplate = '%s %s :%%s' % (command, target)
         # length of self.botsender.raw is 0 when not set :P
         # + 2 because of leading : and space after nickmask
-        prefix_length = len(self.botsender.raw) + 2 + len(privmsg %
-                                                          (target, ''))
+        prefix_length = len(self.botsender.raw) + 2 + len(msgtemplate % '')
         for line in wrap(msg, MAX_LENGTH - prefix_length):
-            self.RAW(privmsg % (target, line))
+            yield msgtemplate % line
 
     def JOIN(self, channels):
         if isinstance(channels, (list, set, tuple)):
@@ -85,7 +95,7 @@ class Context(data.Object):
         join = 'JOIN '
         msg = join
 
-        #Build up join messages (wrap won't work)
+        # Build up join messages (wrap won't work)
         while channels:
             channel = channels.pop() + ','
             if len(msg + channel) > MAX_LENGTH:
@@ -114,8 +124,8 @@ class Client(object):
         self.reconnect = True
         self.__register_client_hooks(self.config)
 
-    #The IRC client Event Loop
-    #Call events for every irc message
+    # The IRC client Event Loop
+    # Call events for every irc message
     def _try_connect(self):
         for server in self.servers:
             host, port, ssl = self.__parseserver(server)
@@ -291,6 +301,9 @@ class Message (object):
     def get_parser(cls, kind):
         return cls._parsers.get(kind)
 
+    def copy(self, irc_c):
+        return type(self)(irc_c, self.raw)
+
     def __init__(self, irc_c, raw):
         self.raw = raw
         match = Message.MSG_REGEX.search(raw)
@@ -363,19 +376,20 @@ class Message (object):
 Message.add_parser('PRIVMSG', Message._directed_message)
 Message.add_parser('NOTICE', Message._directed_message)
 Message.add_parser('INVITE', Message._directed_message)
+Message.add_parser('TOPIC', Message._directed_message)
 
 
-class Sender(unicode):
+class Sender(str):
     """all the logic one would need for understanding sender part of irc msg"""
     def __new__(cls, sender):
         #Pull out each of the pieces at instance time
         if '!' in sender:
             nick, _, usermask = sender.partition('!')
-            inst = unicode.__new__(cls, nick)
+            inst = str.__new__(cls, nick)
             inst._user, _, inst._hostname = usermask.partition('@')
             return inst
         else:
-            return unicode.__new__(cls, sender)
+            return str.__new__(cls, sender)
 
     @property
     def raw(self):
