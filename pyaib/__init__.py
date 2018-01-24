@@ -1,6 +1,6 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 #
-# Copyright 2013 Facebook
+# Copyright 2013-current Facebook
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
 # not use this file except in compliance with the License. You may obtain
@@ -14,18 +14,4 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-from __future__ import (absolute_import, division, print_function,
-                        unicode_literals)
-
-from collections import namedtuple
-
-# a namedtuple like that given by sys.version_info
-__version_info__ = namedtuple(
-    'version_info',
-    'major minor micro releaselevel serial')(major=2,
-                                             minor=1,
-                                             micro=0,
-                                             releaselevel='final',
-                                             serial=0)
-
-__version__ = '{v.major}.{v.minor}.{v.micro}'.format(v=__version_info__)
+__version__ = '18.1.0'

@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Copyright 2013 Facebook
+# Copyright 2013-current Facebook
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
 # not use this file except in compliance with the License. You may obtain
@@ -14,32 +14,48 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-try:
-    from setuptools import setup
-except ImportError:
-    from distutils.core import setup
+import ast
+import os
+import re
+from setuptools import setup, find_packages
+import sys
 
-#Pull version out of the module
-from pyaib import __version__
+assert sys.version_info >= (3, 6, 0), 'pyaib requires Python >=3.6'
 
-setup(name='pyaib',
-      version=__version__,
-      packages=['pyaib', 'pyaib.dbd', 'pyaib.util'],
-      url='http://github.com/facebook/pyaib',
-      license='Apache 2.0',
-      author='Jason Fried, Facebook',
-      author_email='fried@fb.com',
-      description='Python Framework for writing IRC Bots using gevent',
-      classifiers=[
-          'License :: OSI Approved :: Apache Software License',
-          'Topic :: Communications :: Chat :: Internet Relay Chat',
-          'Programming Language :: Python :: 2.7',
-          'Programming Language :: Python :: 3.5',
-          'Intended Audience :: Developers',
-          'Development Status :: 5 - Production/Stable',
-      ],
-      install_requires=[
-          'pyOpenSSL >= 0.12',
-          'gevent >= 1.1.0',
-          'PyYAML >= 3.09',
-      ])
+thisdir = os.path.abspath(os.path.dirname(__file__))
+with open(os.path.join(thisdir, 'README.rst'), 'r') as f:
+    long_description = f.read()
+
+_version_re = re.compile(r'__version__\s+=\s+(?P<version>.*)')
+
+with open(os.path.join(thisdir, 'pyaib', '__init__.py'), 'r') as f:
+        version = _version_re.search(f.read()).group('version')
+        version = str(ast.literal_eval(version))
+
+setup(
+    name='pyaib',
+    version=version,
+    url='http://github.com/facebook/pyaib',
+    license='Apache 2.0',
+    author='Jason Fried, Facebook',
+    author_email='fried@fb.com',
+    description='Python Framework for writing IRC Bots using gevent',
+    long_description=long_description,
+    classifiers=[
+        'License :: OSI Approved :: Apache Software License',
+        'Topic :: Communications :: Chat :: Internet Relay Chat',
+        'Programming Language :: Python :: 3.6',
+        'Intended Audience :: Developers',
+        'Development Status :: 5 - Production/Stable',
+        'Operating System :: POSIX',
+        'Operating System :: MacOS :: MacOS X',
+    ],
+    packages=find_packages(
+        exclude=['*.test', '*.test.*'],
+        include=['pyaib.*', 'pyaib'],
+    ),
+    test_suite="pyaib.test",
+    install_requires=[
+        'toml >= 0.9.4',
+    ],
+)
