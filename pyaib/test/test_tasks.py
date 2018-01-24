@@ -49,8 +49,6 @@ class ManagerTests(unittest.TestCase):
         self.tm = tasks.Manager(2, 0.1)
 
     def tearDown(self) -> None:
-        import gc
-
         new_tasks = asyncio.Task.all_tasks() - self.existing_tasks
         self.assertEqual(set(), new_tasks, "Left over tasks")
         self.existing_tasks = set()
