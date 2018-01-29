@@ -20,6 +20,7 @@ import typing
 import unittest
 import unittest.mock
 
+from . import AsyncBase
 from .. import tasks
 
 
@@ -39,19 +40,13 @@ async def raises_task() -> None:
     raise Exception
 
 
-class ManagerTests(unittest.TestCase):
+class ManagerTests(AsyncBase):
     loop: asyncio.AbstractEventLoop
     existing_tasks: typing.Set[asyncio.Task]
 
     def setUp(self) -> None:
-        self.loop = asyncio.get_event_loop()
-        self.existing_tasks = asyncio.Task.all_tasks()
+        super().setUp()
         self.tm = tasks.Manager(2, 0.1)
-
-    def tearDown(self) -> None:
-        new_tasks = asyncio.Task.all_tasks() - self.existing_tasks
-        self.assertEqual(set(), new_tasks, "Left over tasks")
-        self.existing_tasks = set()
 
     def test_add_and_service(self) -> None:
         async def inner_test() -> None:

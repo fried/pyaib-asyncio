@@ -1,6 +1,6 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 #
-# Copyright 2013 Facebook
+# Copyright 2013-current Facebook
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
 # not use this file except in compliance with the License. You may obtain
@@ -14,58 +14,42 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-from __future__ import (absolute_import, division, print_function,
-                        unicode_literals)
-
-import collections
+import asyncio
+import collections.abc
+import heapq
+import inspect
+import logging
 import time
+import typing
 
-#TODO Look into replacing timers with some kind of gevent construct
+from . import irc
+from . import tasks
 
-
-class Timers(object):
-    """ A Timers Handler """
-    def __init__(self, context):
-        self.__timers = []
-
-    def __call__(self, irc_c):
-        for timer in self.__timers:
-            timer(time.time(), irc_c)
-            if not timer:
-                self.__timers.remove(timer)
-
-    #Returns the timer
-    def set(self, *args, **keywargs):
-        timer = Timer(*args, **keywargs)
-        if timer:
-            self.__timers.append(timer)
-        return bool(timer)
-
-    def reset(self, message, callable):
-        for timer in self.__timers:
-            if timer.message == message and timer.callable == callable:
-                if timer.every:
-                    timer.at = time.time() + timer.every
-                else:
-                    self.__timers.remove(timer)
-
-    def clear(self, message, callable):
-        for timer in self.__timers:
-            if timer.message == message and timer.callable == callable:
-                self.__timers.remove(timer)
-
-    def __len__(self):
-        return len(self.__timers)
+ONE_DAY = 3600 * 24
+logger = logging.getLogger(__name__)
 
 
-class Timer(object):
+class Timer:
     """A Single Timer"""
     # message = Message That gets passed to the callable
     # at = Time when trigger will ring
     # every = How long to push the 'at' time after timer rings
     # count = Number of times the timer will fire before clearing
     # callable = a callable object
-    def __init__(self, message, callable, at=None, every=None, count=None):
+    expired: bool
+    message: str
+    at: float
+    every: typing.Optional[float]
+    count: typing.Optional[int]
+
+    def __init__(
+        self,
+        message: str,
+        callable: typing.Callable,
+        at: typing.Optional[float]=None,
+        every: typing.Optional[float]=None,
+        count: typing.Optional[int]=None,
+    ) -> None:
         self.expired = False
         self.message = message
         if at is None:
@@ -76,38 +60,131 @@ class Timer(object):
             self.at = at
         self.count = count
         self.every = every
-        if isinstance(callable, collections.Callable):
-            self.callable = callable
+        self.callable = callable
+        if count is not None and count < 1:
+            raise ValueError('This timer will never run when count < 1')
+
+        if not isinstance(callable, collections.Callable):  # type: ignore
+            raise TypeError('{callable!r} is not callable')
+
+    def __bool__(self) -> bool:
+        return not self.expired
+
+    def reset(self) -> None:
+        if self.every:
+            self.at = time.time() + self.every
+            if self.count:
+                self.count -= 1
+                if self.count <= 1:
+                    self.expire()
         else:
-            print('Timer Error: %s not callable' % repr(callable))
-            self.expired = True
+            self.expire()
 
-    def __bool__(self):
-        return self.expired is False
+    def expire(self) -> None:
+        self.expired = True
 
-    __nonzero__ = __bool__
+    # Ring Check
+    def __call__(
+        self, timestamp: float, irc_c: irc.Context
+    ) -> typing.Optional[typing.Awaitable]:
 
-    #Ring Check
-    def __call__(self, timestamp, irc_c):
-        if not isinstance(self.callable, collections.Callable):
-            print('Timer Error: (%r:%r) not callable'
-                  % (self.message, callable))
-            return
+        try:
+            result = self.callable(irc_c, self.message)
+        except Exception:
+            logger.exception(
+                f'Timer({self.message}, {self.callable}) raised exception'
+            )
 
-        if not self:  # Sanity test for expired alarms
-            return
+        self.reset()
+        if result and inspect.isawaitable(result):  # Awaitable
+            return result
+        return None
 
-        if timestamp >= self.at:
-            #Throw it into a greenlit
-            irc_c.bot_greenlets.spawn(self.callable, irc_c, self.message)
+    # To be sortable
+    def __lt__(self, other: 'Timer') -> bool:
+        return self.at < other.at
 
-            #Reset the timer
-            if self.every:
-                self.at = time.time() + self.every
-                if self.count:
-                    if self.count <= 1:
-                        self.expired = True
-                    else:
-                        self.count -= 1
-            else:
-                self.expired = True
+
+class Manager(object):
+    """ A Timers Manager """
+    _heapq: typing.List[Timer]
+    _tasks: tasks.Manager
+    _loop: asyncio.AbstractEventLoop
+    _handle: typing.Optional[asyncio.Handle] = None
+    irc_c: irc.Context
+
+    def __init__(self, context):
+        self._heapq = []
+        self._tasks = tasks.Manager()
+        self._loop = asyncio.get_event_loop()
+        self.irc_c = context
+
+    async def __aenter__(self) -> "Manager":
+        self._tasks.auto_service()
+        return self
+
+    async def __aexit__(self, *args: typing.Any) -> None:
+        self._cancel_alarm()
+        self._tasks.cancel_all()
+        self._tasks.stop()
+
+    def _cancel_alarm(self) -> None:
+        if self._handle is not None:
+            self._handle.cancel()
+
+    def _set_alarm(self) -> None:
+        if not self._heapq:
+            self._cancel_alarm()
+        next_timer = self._heapq[0].at
+        self._cancel_alarm()
+        self._handle = self._loop.call_at(min(next_timer, ONE_DAY), self._alarm)
+
+    def _alarm(self) -> None:
+        irc_c = self.irc_c
+        poped_timers: typing.List[Timer] = []
+        if time.time() >= self._heapq[0].at:
+            try:
+                while True:
+                    now = time.time()
+                    if not now >= self._heapq[0].at:
+                        break
+                    timer = heapq.heappop(self._heapq)
+                    poped_timers.append(timer)
+                    if not timer:
+                        continue
+                    task = timer(now, irc_c)
+                    if task:
+                        self._tasks.add(task)
+            except IndexError:
+                # We can move on, we have run through all the timers
+                pass
+
+        for timer in poped_timers:
+            if timer:
+                heapq.heappush(self._heapq, timer)
+
+        self._set_alarm()
+
+    def set(self, *args, **keywargs) -> bool:
+        timer = Timer(*args, **keywargs)
+        if timer:
+            heapq.heappush(self._heapq, timer)
+            self._set_alarm()
+        return bool(timer)
+
+    def reset(self, message: str, callable: typing.Callable) -> None:
+        rebuild = True
+        for timer in self._heapq:
+            if timer.message == message and timer.callable == callable:
+                timer.reset()
+                rebuild = True
+        if rebuild:
+            heapq.heapify(self._heapq)
+
+    def clear(self, message: str, callable: typing.Callable) -> None:
+        for timer in self._heapq:
+            if timer.message == message and timer.callable == callable:
+                timer.expire()
+
+    def __len__(self) -> int:
+        return len(self._heapq)

@@ -1,6 +1,6 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 #
-# Copyright 2013 Facebook
+# Copyright 2013-current Facebook
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may
 # not use this file except in compliance with the License. You may obtain
@@ -13,105 +13,119 @@
 # WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 # License for the specific language governing permissions and limitations
 # under the License.
-
-from __future__ import (absolute_import, division, print_function,
-                        unicode_literals)
+import asyncio
+import logging
 import re
 import sys
 from textwrap import wrap
-import traceback
 import time
-
-import gevent
+import typing
 
 from .linesocket import LineSocket
 from .util import data
-from .util.decorator import raise_exceptions
 from . import __version__ as pyaib_version
 
-if sys.version_info.major == 2:
-    str = unicode  # noqa
 
 MAX_LENGTH = 510
+logger = logging.getLogger(__name__)
+UNCLEAN_MSG_TYPE = typing.Union[str, typing.Iterable[str]]
 
-#Class for storing irc related information
+
+def clean_msg(self, msg: UNCLEAN_MSG_TYPE) -> str:
+    if not isinstance(msg, str):
+        msg = ' '.join(msg)
+    msg = re.sub(r'[\r\n]', '', msg).expandtabs(4).rstrip()
+    return msg
+
+
 class Context(data.Object):
     """Dummy Object to hold irc data and send messages"""
     # IRC COMMANDS are all CAPS for sanity with irc information
     # TODO: MOVE irc commands into component and under irc_c.cmd
 
     # Raw IRC Message
-    def RAW(self, message):
+    async def RAW(self, message: UNCLEAN_MSG_TYPE) -> None:
         try:
-            #Join up the message parts
-            if isinstance(message, (list, tuple)):
-                message = ' '.join(message)
-            #Raw Send but don't allow empty spam
-            if message is not None:
-                #Clean up messages
-                message = re.sub(r'[\r\n]', '', message).expandtabs(4).rstrip()
-                if len(message):
-                    self.client.socket.writeline(message)
-                    #Fire raw send event for debug if exists [] instead of ()
-                    self.events['IRC_RAW_SEND'](self, message)
+            message = clean_msg(message)
+            if len(message):
+                await self.client.socket.writeline(message.encode('utf-8'))
+                # Fire raw send event for debug if exists [] instead of ()
+                self.events['IRC_RAW_SEND'](self, message)
         except TypeError:
-            #Somebody tried to raw a None or something just print exception
-            print("Bad RAW message: %r" % repr(message))
-            exc_type, exc_value, exc_traceback = sys.exc_info()
-            traceback.print_tb(exc_traceback)
+            # Somebody tried to raw a None or something just print exception
+            logger.exception(f'Bad RAW message: {message!r}')
 
     # Set our nick
-    def NICK(self, nick):
-        self.RAW('NICK %s' % nick)
+    async def NICK(self, nick) -> None:
+        await self.RAW(f'NICK {nick}')
+        # TODO: WE Should have a way to await the nick response event
+
         if not self.registered:
-            #Assume we get the nick we want during registration
+            # Assume we get the nick we want during registration
             self.botnick = nick
 
     # privmsg/notice with max line handling
-    def PRIVMSG(self, target, msg):
-        for line in self._wrap_command('PRIVMSG', target, msg):
-            self.RAW(line)
+    async def PRIVMSG(self, target: str, msg: UNCLEAN_MSG_TYPE) -> None:
+        try:
+            msg = clean_msg(msg)
+            lines = self._wrap_command('PRIVMSG', target, msg)
+            await self.client.socket.writelines(lines)
+        except TypeError:
+            logger.exception(f'Bad PRIVMSG message: {msg!r}')
 
-    def NOTICE(self, target, msg):
-        for line in self._wrap_command('NOTICE', target, msg):
-            self.RAW(line)
+    async def NOTICE(self, target: str, msg: UNCLEAN_MSG_TYPE) -> None:
+        try:
+            msg = clean_msg(msg)
+            lines = self._wrap_command('NOTICE', target, msg)
+            await self.client.socket.writelines(lines)
+        except TypeError:
+            logger.exception(f'Bad NOTICE message: {msg!r}')
 
-    def _wrap_command(self, command, target, msg):
-        if isinstance(msg, (list, tuple, set)):
-            msg = ' '.join(msg)
-        msgtemplate = '%s %s :%%s' % (command, target)
+    def _wrap_command(self, command: str, target: str, msg: str) -> bytes:
+        msgtemplate = f'{command} {target} :'
         # length of self.botsender.raw is 0 when not set :P
         # + 2 because of leading : and space after nickmask
-        prefix_length = len(self.botsender.raw) + 2 + len(msgtemplate % '')
+        prefix_length = len(self.botsender.raw) + 2 + len(msgtemplate)
         for line in wrap(msg, MAX_LENGTH - prefix_length):
-            yield msgtemplate % line
+            yield f'{msgtemplate}{line}'.encode('utf-8')
 
-    def JOIN(self, channels):
-        if isinstance(channels, (list, set, tuple)):
-            channels = list(channels)
-        else:
-            channels = [channels]
+    async def JOIN(
+        self,
+        channels: typing.Union[typing.Iterable[str], str]
+    ) -> None:
+        # TODO: this could block until the join completes
+        if isinstance(channels, str):
+            channels = channels.split(',')
 
         join = 'JOIN '
         msg = join
 
         # Build up join messages (wrap won't work)
-        while channels:
-            channel = channels.pop() + ','
-            if len(msg + channel) > MAX_LENGTH:
-                self.RAW(msg.rstrip(','))
-                msg = join
-            msg += channel
+        lines = []
+        for channel in channels:
+            channel = channel.strip()
+            new_msg = f'{msg}{channel}' if msg is join else f'{msg},{channel}'
+            if len(new_msg) > MAX_LENGTH:
+                if msg is join:
+                    raise ValueError(f'{channel!r} name is too long')
+                lines.append(msg)
+                new_msg = f'{join}{channel}'
+            msg = new_msg
 
-        self.RAW(msg.rstrip(','))
+        lines.append(msg)
+        await self.client.socket.writelines(lines)
 
-    def PART(self, channels, message=None):
-        if isinstance(channels, list):
+    async def PART(
+        self,
+        channels: typing.Union[typing.Iterable[str], str],
+        message: str=None
+    ) -> None:
+        if not isinstance(channels, str):
             channels = ','.join(channels)
         if message:
-            self.RAW('PART %s :%s' % (channels, message))
+            await self.RAW(f'PART {channels} :{message}')
         else:
-            self.RAW('PART %s' % channels)
+            await self.RAW(f'PART {channels}')
 
 
 class Client(object):
@@ -139,110 +153,107 @@ class Client(object):
         while True:  # Event still running
             raw = sock.readline()  # Yield
             if raw:
-                #Fire RAW MSG if it has observers
+                # Fire RAW MSG if it has observers
                 irc_c.events['IRC_RAW_MSG'](irc_c, raw)
-                #Parse the RAW message
+                # Parse the RAW message
                 msg = Message(irc_c, raw)
                 if msg:  # This is a valid message
-                    #So we can do length calculations for PRIVMSG WRAPS
+                    # So we can do length calculations for PRIVMSG WRAPS
                     if (msg.nick == irc_c.botnick
                             and irc_c.botsender != msg.sender):
                         irc_c.botsender = msg.sender
-                    #Event for kind of message [if exists]
+                    # Event for kind of message [if exists]
                     eventKey = 'IRC_MSG_%s' % msg.kind
                     irc_c.events[eventKey](irc_c, msg)
-                    #Event for parsed messages [if exists]
+                    # Event for parsed messages [if exists]
                     irc_c.events['IRC_MSG'](irc_c, msg)
 
-    def run(self):
+    async def start(self):
         irc_c = self.irc_c
 
-        #Function to Fire Timers
+        # Function to Fire Timers
+        # TODO: Re-write timers using asyncio and a heapq
         def _timers(irc_c):
             print("Starting Timers Loop")
             while True:
-                gevent.sleep(1)
+                # gevent.sleep(1)
                 irc_c.timers(irc_c)
 
-        #If servers is not a list make it one
-        if not isinstance(self.servers, list):
+        # If servers is not a list make it one
+        if isinstance(self.servers, str):
             self.servers = self.servers.split(',')
+        server_list = iter(self.servers)
         while self.reconnect:
-            # Keep trying to reconnect going through the server list
-            sock = self._try_connect()
-            if sock is None:
-                gevent.sleep(10)  # Wait 10 Seconds between retries
-                print("Retrying Server List...")
-                continue
-            #Catch when the socket has an exception
             try:
-                #Have the line socket autofill its buffers
-                #Maybe this should be in socket.connect
-                gevent.spawn(raise_exceptions(self.socket.run))
-                gevent.sleep(0)  # Yield
-                #Fire Socket Connect Event (Always)
-                irc_c.events('IRC_SOCKET_CONNECT')(irc_c)
-                irc_c.bot_greenlets.spawn(_timers, irc_c)
-                #Enter the irc event loop
-                self._fire_msg_events(sock, irc_c)
-            except LineSocket.SocketError:
-                try:
-                    self.socket.close()
-                    print("Giving Greenlets Time(1s) to die..")
-                    irc_c.bot_greenlets.join(timeout=1)
-                except gevent.Timeout:
-                    # We got a timeout kill the others
-                    print("Killing Remaining Greenlets...")
-                    irc_c.bot_greenlets.kill()
+                server = next(server_list)
+            except StopIteration:
+                logger.info("Retrying Server List in 10s...")
+                asyncio.sleep(10)
+                server_list = iter(self.servers)
+                continue
+
+            try:
+                async with LineSocket(**self.__parseserver(server)) as sock:
+                    # Fire Socket Connect Event (Always)
+                    irc_c.events('IRC_SOCKET_CONNECT')(irc_c)
+                    # Start Timers
+                    # Fire events
+                    await self._fire_msg_events(sock, irc_c)
+            except OSError:
+                # propigate a reconnect exception to all event waiters
+                # cancel all tasks belonging to the bot
+                # stop timers
+                # gather all tasks
+                logger.exception('Error creating Socket, going to reconnect')
         else:
-            print("Bot Dying.")
+            logger.info("Bot Dying.")
 
-    def die(self, message="Dying"):
-        self.irc_c.RAW("QUIT :%s" % message)
+    async def die(self, message="Dying"):
+        await self.irc_c.RAW(f'QUIT :{message}')
         self.reconnect = False
 
-    def cycle(self):
-        self.irc_c.RAW("QUIT :Reconnecting")
+    async def cycle(self):
+        await self.irc_c.RAW('QUIT :Reconnecting')
 
-    def signal_handler(self, signum, frame):
+    async def signal_handler(self):
         """ Handle Ctrl+C """
-        self.irc_c.RAW("QUIT :Received a ctrl+c exiting")
+        await self.irc_c.RAW("QUIT :Received a ctrl+c exiting")
         self.reconnect = False
 
-    #Register our own hooks for basic protocol handling
+    # Register our own hooks for basic protocol handling
     def __register_client_hooks(self, options):
         events = self.irc_c.events
         timers = self.irc_c.timers
 
-        #AUTO_PING TIMER
-        def AUTO_PING(irc_c, msg):
-            irc_c.RAW('PING :%s' % irc_c.server)
-        #if auto_ping unless set to 0
+        # AUTO_PING TIMER
+        async def AUTO_PING(irc_c, msg):
+            await irc_c.RAW(f'PING :{irc_c.server}')
+
+        # if auto_ping unless set to 0
         if options.auto_ping != 0:
             timers.set('AUTO_PING', AUTO_PING,
                        every=options.auto_ping or 600)
 
-        #Handle PINGs
-        def PONG(irc_c, msg):
-            irc_c.RAW('PONG :%s' % msg.args)
-            #On a ping from the server reset our timer for auto-ping
+        # Handle PINGs
+        async def PONG(irc_c, msg):
+            await irc_c.RAW(f'PONG :{msg.args}')
+            # On a ping from the server reset our timer for auto-ping
             timers.reset('AUTO_PING', AUTO_PING)
         events('IRC_MSG_PING').observe(PONG)
 
-        #On the socket connecting we should attempt to register
-        def REGISTER(irc_c):
+        # On the socket connecting we should attempt to register
+        async def REGISTER(irc_c):
             irc_c.registered = False
             if options.password:  # Use a password if one is issued
-                #TODO allow password to be associated with server url
-                irc_c.RAW('PASS %s' % options.password)
-            irc_c.RAW('USER %s 8 * :%s'
-                      % (options.user,
-                         options.realname.format(version=pyaib_version)))
-            irc_c.NICK(options.nick)
+                # TODO allow password to be associated with server url
+                await irc_c.RAW(f'PASS {options.password}')
+            realname = options.realname.format(version=pyaib_version)
+            await irc_c.RAW(f'USER {options.user} 8 * :{realname}')
+            await irc_c.NICK(options.nick)
         events('IRC_SOCKET_CONNECT').observe(REGISTER)
 
-        #Trigger an IRC_ONCONNECT event on 001 msg's
-        def ONCONNECT(irc_c, msg):
+        # Trigger an IRC_ONCONNECT event on 001 msg's
+        async def ONCONNECT(irc_c, msg):
             irc_c.server = msg.sender
             irc_c.registered = True
             irc_c.events('IRC_ONCONNECT')(irc_c)
